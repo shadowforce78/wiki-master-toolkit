@@ -196,13 +196,82 @@
           }
           return report;
         };
-        try {
-          if (navigator.locks?.request) return await navigator.locks.request('wm-discard-operation', { ifAvailable: true }, async lock => {
-            if (!lock) throw Error('Une défausse est déjà en cours dans un autre onglet.');
-            return run();
-          });
-          return await run();
-        } finally { active = false; }
+        try { return await runLocked(run); }
+        finally { active = false; }
+      }
+      async function runLocked(run) {
+        if (!navigator.locks?.request) return run();
+        return navigator.locks.request('wm-discard-operation', { ifAvailable: true }, async lock => {
+          if (!lock) throw Error('Une défausse est déjà en cours dans un autre onglet.');
+          return run();
+        });
+      }
+      // Discards pulled cards the user picked by hand (pack summary). Pack responses only know
+      // catalogue IDs, so copies are resolved here from a fresh full collection read. Favorites,
+      // shiny copies and anything in a pending trade or sale are never picked.
+      async function discardPulled(requests, onProgress = () => {}) {
+        if (active) throw Error('Une opération est déjà en cours.');
+        const wanted = new Map();
+        for (const request of Array.isArray(requests) ? requests : []) {
+          if (!model.UUID.test(request?.cardId)) throw Error('Carte invalide.');
+          wanted.set(request.cardId, (wanted.get(request.cardId) || 0) + 1);
+        }
+        if (!wanted.size) throw Error('Aucune carte sélectionnée.');
+        active = true; cancelled = false;
+        const report = { at: Date.now(), source: 'pack-summary', selected: 0, discarded: 0, skipped: 0, batches: [], status: 'verifying' };
+        const missing = {};
+        const run = async () => {
+          try {
+            onProgress({ text: 'Vérification de la collection…', report });
+            const fresh = await readCollection(text => onProgress({ text, report }));
+            snapshot = fresh;
+            updateOwnership([], true);
+            const { tradeIds, saleIds } = fresh.protections;
+            const chosen = [];
+            for (const [cardId, count] of wanted) {
+              const copies = fresh.entries.filter(row => row.cardId === cardId && !row.starred && !row.shiny
+                && !tradeIds.has(cardId) && !tradeIds.has(row.ownedId) && !saleIds.has(cardId));
+              chosen.push(...copies.slice(0, count));
+              const short = Math.max(0, count - copies.length);
+              if (short) missing[cardId] = short;
+              report.skipped += short;
+            }
+            report.selected = chosen.length;
+            for (let offset = 0; offset < chosen.length; offset += BATCH_SIZE) {
+              checkStop(); checkPause();
+              const batch = chosen.slice(offset, offset + BATCH_SIZE);
+              const attempt = { ids: batch.map(row => row.ownedId), status: 'pending' };
+              report.batches.push(attempt); report.status = 'running'; saveReport(report);
+              onProgress({ text: `Défausse : ${report.discarded} / ${chosen.length}`, report });
+              let data;
+              try {
+                data = await request('/api/user-cards/bulk-discard', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card_ids: attempt.ids }) });
+                if (!Number.isSafeInteger(data.discarded_count) || data.discarded_count < 0 || data.discarded_count > batch.length
+                  || (data.failed != null && !Array.isArray(data.failed))) throw Error('Résultat de défausse incomplet.');
+              } catch (error) {
+                attempt.status = 'unconfirmed';
+                updateOwnership(batch, false);
+                throw Error(`${error.message} Le résultat de ce lot est à vérifier sur le site ; aucun nouvel essai automatique.`);
+              }
+              attempt.discarded = data.discarded_count;
+              attempt.failed = data.failed || [];
+              report.discarded += data.discarded_count;
+              attempt.status = data.discarded_count === batch.length && !attempt.failed.length ? 'done' : 'partial';
+              updateOwnership(batch, attempt.status === 'done');
+              saveReport(report);
+              if (attempt.status === 'partial') throw Error(`${data.discarded_count} / ${batch.length} exemplaires défaussés dans le dernier lot. Arrêt pour vérifier les refus du serveur.`);
+              if (offset + BATCH_SIZE < chosen.length) await wait(500);
+            }
+            report.status = 'done';
+          } catch (error) {
+            report.status = cancelled ? 'stopped' : 'error'; report.error = error.message;
+          } finally {
+            snapshot = null; saveReport(report);
+          }
+          return { ...report, missing };
+        };
+        try { return await runLocked(run); }
+        finally { active = false; }
       }
       function stop() { cancelled = true; }
       function ensureButton() {
@@ -344,7 +413,7 @@
         try { fromCache(); }
         catch (error) { status.textContent = error.message; loadButton.hidden = false; }
       }
-      return { cachedPlan, analyse, currentPlan, execute, stop, ensureButton, openDialog, getReport: () => core.readLocalValue(REPORT_KEY) };
+      return { cachedPlan, analyse, currentPlan, execute, discardPulled, stop, ensureButton, openDialog, getReport: () => core.readLocalValue(REPORT_KEY) };
     }
   };
 })();

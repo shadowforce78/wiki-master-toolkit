@@ -286,3 +286,26 @@ test('ambiguous removals invalidate ownership claims rather than offering uncert
   const owned = f.store.get('wm_all_collection_v1'); assert.equal(owned.complete, false); assert.equal(owned.cards.length, 0);
   assert.equal(f.store.get('wm_avg_v3_' + DEF).averages.C, 0);
 });
+
+test('discardPulled discards only unprotected copies of the picked cards and reports the shortfall', async () => {
+  const f = fixture(0);
+  const other = uuid(9001);
+  f.setRows([
+    entry(1), entry(2, { starred: true }), entry(3, { is_shiny: true }), entry(4), entry(5),
+    entry(6, { card_id: other, card: { id: other, rarity: 'C', wikipedia_title: 'Other' } })
+  ]);
+  f.setSelling([{ card_id: other }]);
+  // 4 copies of DEF wanted but only 3 are unprotected (1, 4, 5); the single `other` copy is on sale.
+  const report = await f.service.discardPulled([DEF, DEF, DEF, DEF, other].map(cardId => ({ cardId })));
+  assert.equal(report.status, 'done');
+  assert.equal(report.discarded, 3);
+  assert.deepEqual({ ...report.missing }, { [DEF]: 1, [other]: 1 });
+  assert.deepEqual(f.posts().map(call => call.body.card_ids).flat().sort(), [uuid(1), uuid(4), uuid(5)].sort());
+});
+
+test('discardPulled refuses an empty or malformed selection before any request', async () => {
+  const f = fixture(1);
+  await assert.rejects(f.service.discardPulled([]));
+  await assert.rejects(f.service.discardPulled([{ cardId: 'nope' }]));
+  assert.equal(f.calls.length, 0);
+});

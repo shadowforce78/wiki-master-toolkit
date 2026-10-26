@@ -26,6 +26,11 @@
       let openAllSummaryTitle = 'Cartes obtenues';
       let openAllSummaryOnClose = null;
       let openAllSummaryReloadOnClose = true;
+      // Sélection et état des lignes du récap « Tout ouvrir », indexés par position d'origine.
+      let openAllSelected = new Set();
+      let openAllRowState = new Map();
+      let openAllActionBusy = false;
+      let openAllActionsLocked = false;
       let autoOpenEnabled = runtime.settings.isEnabled('autoOpen') && readLocalValue(AUTO_OPEN_ENABLED_KEY) === true;
       let autoOpenTimer = null;
       let autoOpenRequestId = null;
@@ -711,7 +716,20 @@
 
         rows.forEach((row, index) => {
           const item = document.createElement('div');
-          item.className = 'wm-open-all-row';
+          item.className = 'wm-open-all-row wm-open-all-row-selectable';
+
+          const rowState = openAllRowState.get(row._originalIndex);
+          const pick = document.createElement('input');
+          pick.type = 'checkbox';
+          pick.className = 'wm-open-all-pick';
+          pick.setAttribute('aria-label', `Sélectionner ${row.title}`);
+          pick.checked = openAllSelected.has(row._originalIndex);
+          pick.disabled = openAllActionBusy || openAllActionsLocked || rowState?.done === true;
+          pick.addEventListener('change', () => {
+            if (pick.checked) openAllSelected.add(row._originalIndex);
+            else openAllSelected.delete(row._originalIndex);
+            updateOpenAllActions();
+          });
 
           const rank = document.createElement('span');
           rank.className = 'wm-open-all-rank';
@@ -734,7 +752,8 @@
           name.textContent = row.title;
 
           const meta = document.createElement('span');
-          meta.textContent = row.rarity || '—';
+          meta.textContent = rowState?.text ? `${row.rarity || '—'} · ${rowState.text}` : (row.rarity || '—');
+          if (rowState?.done) item.classList.add('is-done');
 
           info.append(name, meta);
 
@@ -753,7 +772,7 @@
             value.classList.add('is-empty');
           }
 
-          item.append(rank, thumb, info, value);
+          item.append(pick, rank, thumb, info, value);
           fragment.append(item);
         });
 
@@ -779,6 +798,10 @@
         document.getElementById('wm-open-all-overlay')?.remove();
 
         openAllSummaryCards = cards;
+        openAllSelected = new Set();
+        openAllRowState = new Map();
+        openAllActionBusy = false;
+        openAllActionsLocked = false;
         openAllOpenedPacks = openedPacks;
         openAllError = error;
         openAllSummaryTitle = options.title || 'Cartes obtenues';
@@ -812,11 +835,14 @@
         closeButton.setAttribute('aria-label', 'Fermer');
 
         const close = () => {
+          if (openAllActionBusy) return;
           overlay.remove();
           const onClose = openAllSummaryOnClose;
           const reloadOnClose = openAllSummaryReloadOnClose;
 
           openAllSummaryCards = [];
+          openAllSelected = new Set();
+          openAllRowState = new Map();
           openAllError = null;
           openAllSummaryTitle = 'Cartes obtenues';
           openAllSummaryOnClose = null;
@@ -844,11 +870,258 @@
         footer.className = 'wm-open-all-footer';
         footer.dataset.role = 'footer';
 
-        modal.append(header, list, footer);
+        modal.append(header, list, buildOpenAllActions(), footer);
         overlay.append(modal);
         document.body.append(overlay);
 
         renderOpenAllSummary();
+        updateOpenAllActions();
+      }
+
+      const AUCTION_DURATIONS = [
+        [10, '10 min'], [30, '30 min'], [60, '1 h'], [180, '3 h'],
+        [360, '6 h'], [720, '12 h'], [1440, '24 h']
+      ];
+
+      function buildOpenAllActions() {
+        const bar = document.createElement('div');
+        bar.className = 'wm-open-all-actions';
+        bar.dataset.role = 'actions';
+
+        const selectAll = document.createElement('label');
+        selectAll.className = 'wm-open-all-select-all';
+        const selectAllBox = document.createElement('input');
+        selectAllBox.type = 'checkbox';
+        selectAllBox.dataset.role = 'select-all';
+        selectAllBox.addEventListener('change', () => {
+          openAllSelected = new Set();
+          if (selectAllBox.checked) {
+            openAllSummaryCards.forEach((_, index) => {
+              if (!openAllRowState.get(index)?.done) openAllSelected.add(index);
+            });
+          }
+          renderOpenAllSummary();
+          updateOpenAllActions();
+        });
+        const selectAllText = document.createElement('span');
+        selectAllText.dataset.role = 'selected-count';
+        selectAll.append(selectAllBox, selectAllText);
+
+        const priceField = document.createElement('label');
+        priceField.className = 'wm-ranking-sale-field';
+        const priceLabel = document.createElement('span');
+        priceLabel.textContent = 'Prix de mise aux enchères';
+        const priceInput = document.createElement('input');
+        priceInput.type = 'number';
+        priceInput.min = '1';
+        priceInput.step = '1';
+        priceInput.value = '10';
+        priceInput.inputMode = 'decimal';
+        priceInput.dataset.role = 'auction-price';
+        priceInput.addEventListener('input', updateOpenAllActions);
+        priceField.append(priceLabel, priceInput);
+
+        const durationField = document.createElement('label');
+        durationField.className = 'wm-ranking-sale-field';
+        const durationLabel = document.createElement('span');
+        durationLabel.textContent = 'Durée';
+        const durationInput = document.createElement('select');
+        durationInput.dataset.role = 'auction-duration';
+        for (const [value, label] of AUCTION_DURATIONS) {
+          const option = document.createElement('option');
+          option.value = String(value);
+          option.textContent = label;
+          durationInput.append(option);
+        }
+        durationInput.value = '10';
+        durationField.append(durationLabel, durationInput);
+
+        const buttons = document.createElement('div');
+        buttons.className = 'wm-open-all-action-buttons';
+
+        const auctionButton = document.createElement('button');
+        auctionButton.type = 'button';
+        auctionButton.className = 'wm-tool-button wm-primary-button';
+        auctionButton.dataset.role = 'auction';
+        auctionButton.addEventListener('click', () => {
+          startOpenAllAuctions(Number(priceInput.value), Number(durationInput.value));
+        });
+
+        const discardButton = document.createElement('button');
+        discardButton.type = 'button';
+        discardButton.className = 'wm-tool-button wm-discard-danger';
+        discardButton.dataset.role = 'discard';
+        discardButton.addEventListener('click', startOpenAllDiscard);
+
+        buttons.append(auctionButton, discardButton);
+
+        const status = document.createElement('div');
+        status.className = 'wm-open-all-action-status';
+        status.dataset.role = 'action-status';
+
+        bar.append(selectAll, priceField, durationField, buttons, status);
+        return bar;
+      }
+
+      function updateOpenAllActions() {
+        const bar = document.querySelector('#wm-open-all-overlay [data-role="actions"]');
+        if (!bar) return;
+
+        const count = openAllSelected.size;
+        const selectable = openAllSummaryCards.filter((_, index) => !openAllRowState.get(index)?.done).length;
+        const blocked = openAllActionBusy || openAllActionsLocked;
+        const price = Number(bar.querySelector('[data-role="auction-price"]').value);
+
+        const selectAllBox = bar.querySelector('[data-role="select-all"]');
+        selectAllBox.checked = selectable > 0 && count >= selectable;
+        selectAllBox.disabled = blocked || selectable === 0;
+        bar.querySelector('[data-role="selected-count"]').textContent =
+          count ? `${count} carte${count > 1 ? 's' : ''} sélectionnée${count > 1 ? 's' : ''}` : 'Tout sélectionner';
+
+        const auctionButton = bar.querySelector('[data-role="auction"]');
+        auctionButton.textContent = count ? `Mettre aux enchères (${count})` : 'Mettre aux enchères';
+        auctionButton.disabled = blocked || !count || !Number.isFinite(price) || price <= 0;
+
+        const discardButton = bar.querySelector('[data-role="discard"]');
+        discardButton.textContent = count ? `Défausser (${count})` : 'Défausser';
+        discardButton.disabled = blocked || !count;
+
+        for (const control of bar.querySelectorAll('input[type="number"], select')) control.disabled = blocked;
+      }
+
+      function setOpenAllActionStatus(text, isError = false) {
+        const node = document.querySelector('#wm-open-all-overlay [data-role="action-status"]');
+        if (!node) return;
+        node.textContent = text || '';
+        node.classList.toggle('is-error', isError);
+      }
+
+      function setOpenAllActionBusy(value) {
+        openAllActionBusy = value;
+        renderOpenAllSummary();
+        updateOpenAllActions();
+      }
+
+      function requestCardListing(card, baseAmount, durationMinutes) {
+        return new Promise((resolve) => {
+          const requestId = `pack-listing:${card.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+          const onResult = (event) => {
+            if (event.detail?.requestId !== requestId) return;
+            window.removeEventListener('wm-average-create-listing-result', onResult);
+            resolve(event.detail);
+          };
+          window.addEventListener('wm-average-create-listing-result', onResult);
+          // Pas d'ID d'exemplaire : le bridge choisit une copie non favorite et pas déjà en vente.
+          window.dispatchEvent(new CustomEvent('wm-average-create-listing', {
+            detail: {
+              requestId,
+              ownedCardId: null,
+              catalogueCardId: card.id,
+              title: card.title,
+              baseAmount,
+              durationMinutes,
+              allowStarred: false
+            }
+          }));
+        });
+      }
+
+      async function startOpenAllAuctions(amount, duration) {
+        if (openAllActionBusy || openAllActionsLocked) return;
+        const indexes = [...openAllSelected].sort((a, b) => a - b);
+        if (!indexes.length || !Number.isFinite(amount) || amount <= 0 || !Number.isFinite(duration) || duration <= 0) return;
+
+        setOpenAllActionBusy(true);
+        let listed = 0;
+        let skipped = 0;
+        let failure = null;
+
+        try {
+          for (const [position, index] of indexes.entries()) {
+            const card = openAllSummaryCards[index];
+            if (!card) continue;
+            setOpenAllActionStatus(`Mise aux enchères ${position + 1} / ${indexes.length}…`);
+
+            const result = await requestCardListing(card, amount, duration);
+            if (result.ok) {
+              listed += 1;
+              openAllRowState.set(index, { done: true, text: `En vente ${formatAverage(amount)} W` });
+              openAllSelected.delete(index);
+            } else if (result.needsStarredConfirmation) {
+              skipped += 1;
+              openAllRowState.set(index, { done: false, text: 'Seul exemplaire en favori, non vendu' });
+              openAllSelected.delete(index);
+            } else if (result.alreadyListed || result.notOwned) {
+              skipped += 1;
+              openAllRowState.set(index, { done: true, text: result.alreadyListed ? 'Déjà en vente' : 'Plus possédée' });
+              openAllSelected.delete(index);
+            } else {
+              failure = result.error || 'erreur inconnue';
+              break;
+            }
+
+            if (position < indexes.length - 1) await new Promise((resolve) => setTimeout(resolve, 700));
+          }
+        } finally {
+          setOpenAllActionBusy(false);
+        }
+
+        const parts = [`${listed} carte${listed > 1 ? 's' : ''} mise${listed > 1 ? 's' : ''} aux enchères`];
+        if (skipped) parts.push(`${skipped} ignorée${skipped > 1 ? 's' : ''}`);
+        if (failure) parts.push(`arrêt : ${failure}`);
+        setOpenAllActionStatus(parts.join(' · '), Boolean(failure));
+      }
+
+      async function startOpenAllDiscard() {
+        if (openAllActionBusy || openAllActionsLocked) return;
+        const indexes = [...openAllSelected].sort((a, b) => a - b);
+        if (!indexes.length) return;
+
+        const confirmed = await runtime.modalUi.showConfirmModal(
+          `Défausser ${indexes.length} carte${indexes.length > 1 ? 's' : ''} ?`,
+          'Les cartes sélectionnées seront définitivement défaussées. Les exemplaires favoris, shiny, en échange ou en vente ne sont jamais touchés.',
+          { confirmLabel: 'Défausser', cancelLabel: 'Annuler' }
+        );
+        if (!confirmed || !openAllSelected.size) return;
+
+        setOpenAllActionBusy(true);
+        const requests = indexes.map((index) => ({ cardId: openAllSummaryCards[index]?.id })).filter((entry) => entry.cardId);
+        let report = null;
+        let failure = null;
+
+        try {
+          report = await runtime.discard.discardPulled(requests, ({ text }) => setOpenAllActionStatus(text));
+        } catch (error) {
+          failure = error?.message || String(error);
+        }
+
+        if (report && report.status === 'done') {
+          // Les cartes non défaussées (protégées) sont les dernières lignes de chaque carte.
+          const missing = { ...report.missing };
+          for (const index of [...indexes].reverse()) {
+            const cardId = openAllSummaryCards[index]?.id;
+            if (missing[cardId] > 0) {
+              missing[cardId] -= 1;
+              openAllRowState.set(index, { done: false, text: 'Protégée, non défaussée' });
+            } else {
+              openAllRowState.set(index, { done: true, text: 'Défaussée' });
+            }
+            openAllSelected.delete(index);
+          }
+          const text = `${report.discarded} carte${report.discarded > 1 ? 's' : ''} défaussée${report.discarded > 1 ? 's' : ''}` +
+            (report.skipped ? ` · ${report.skipped} protégée${report.skipped > 1 ? 's' : ''} ignorée${report.skipped > 1 ? 's' : ''}` : '');
+          setOpenAllActionBusy(false);
+          setOpenAllActionStatus(text);
+          return;
+        }
+
+        // Résultat incertain : on bloque les actions, le site doit être rechargé pour revérifier.
+        openAllActionsLocked = true;
+        setOpenAllActionBusy(false);
+        setOpenAllActionStatus(
+          `${failure || report?.error || 'Défausse interrompue.'} Ferme ce récap pour actualiser le site.`,
+          true
+        );
       }
 
       function mergePulledCardsIntoCollectionCache(cards) {

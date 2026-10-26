@@ -25,3 +25,10 @@ Full ownership reads save reusable metadata and per-copy favorite/shiny flags in
 ## Verification
 
 The v4.29.0 checks target the rarity change: two focused behavior tests verify C/PC defaults, cheap/no-average R/SR/UR/L exclusions, empty/invalid selections and enforcement before POST and after fresh ownership verification. The existing Chromium integration verifies C/PC controls, immediate filter changes, clearing confirmation, explicit R opt-in, cached thumbnails/names and 50/50/25 fixture execution while a zero-priced R copy survives. `artifacts/discard-preview-v4.29.0.png` shows the synthetic local preview. Full unrelated unit suites were not repeated. No real cards were discarded.
+
+## Pack summary actions
+
+The **Tout ouvrir** summary lists a checkbox per pulled card, a **Tout sélectionner** box, and two actions:
+
+- **Mettre aux enchères (N)** lists each selected card one after the other with the shared price and duration fields (default 10 W, 10 min), using the same listing flow as the ranking. A card whose only available copy is a favorite is skipped, never sold.
+- **Défausser (N)** asks for confirmation, rereads the whole collection, then discards one unprotected copy per selected card. Favorites, shiny copies and copies in a pending trade or a sale are never picked; those cards are reported as protected and left alone. If a batch result is uncertain, actions lock until the summary is closed (which refreshes the site).

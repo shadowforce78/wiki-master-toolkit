@@ -25,13 +25,18 @@ function fixture(number = 125, options = {}) {
   const fetch = async (url, init) => {
     const call = { url, method: init.method || 'GET', body: init.body && JSON.parse(init.body) }; calls.push(call);
     if (url.includes('/api/my-collection')) {
-      const page = Number(new URL(url, 'https://www.wiki-masters.com').searchParams.get('page'));
+      const params = new URL(url, 'https://www.wiki-masters.com').searchParams, page = Number(params.get('page')), q = params.get('q');
       if (page === 0) stage++;
-      const data = { collection: rows.slice(page * 50, (page + 1) * 50), total: rows.length, pendingTradeCardIds: pending };
+      const found = q ? rows.filter(row => row.card.wikipedia_title.toLowerCase().includes(q.toLowerCase())) : rows;
+      const data = { collection: found.slice(page * 50, (page + 1) * 50), total: found.length, pendingTradeCardIds: pending };
       const replacement = options.collection?.({ page, stage, data, core });
       return response(200, replacement || data);
     }
     if (url.includes('/api/marketplace?')) return options.market?.() || response(200, { selling });
+    if (/^\/api\/user-cards\/[^/]+\/discard$/.test(url)) {
+      assert.equal(call.method, 'POST'); assert.equal(init.credentials, 'include');
+      return (await options.post?.({ call, core, service, calls })) || response(200, { success: true });
+    }
     assert.equal(url, '/api/user-cards/bulk-discard');
     assert.equal(init.credentials, 'include'); assert.equal(init.headers['Content-Type'], 'application/json');
     const replacement = await options.post?.({ call, core, service, calls });
@@ -296,16 +301,58 @@ test('discardPulled discards only unprotected copies of the picked cards and rep
   ]);
   f.setSelling([{ card_id: other }]);
   // 4 copies of DEF wanted but only 3 are unprotected (1, 4, 5); the single `other` copy is on sale.
-  const report = await f.service.discardPulled([DEF, DEF, DEF, DEF, other].map(cardId => ({ cardId })));
+  const report = await f.service.discardPulled([DEF, DEF, DEF, DEF].map(cardId => ({ cardId, title: 'Card' })).concat({ cardId: other, title: 'Other' }));
   assert.equal(report.status, 'done');
   assert.equal(report.discarded, 3);
   assert.deepEqual({ ...report.missing }, { [DEF]: 1, [other]: 1 });
-  assert.deepEqual(f.posts().map(call => call.body.card_ids).flat().sort(), [uuid(1), uuid(4), uuid(5)].sort());
+  assert.deepEqual(f.posts().map(call => call.url).sort(), [1, 4, 5].map(n => `/api/user-cards/${uuid(n)}/discard`).sort());
+});
+
+test('discardPulled looks copies up by title and uses the per-copy endpoint, never a full collection read', async () => {
+  const f = fixture(0);
+  f.setRows(Array.from({ length: 120 }, (_, i) => entry(i + 1, { card_id: uuid(7000 + i), card: { id: uuid(7000 + i), rarity: 'C', wikipedia_title: `Filler ${i}` } }))
+    .concat(entry(500), entry(501)));
+  const report = await f.service.discardPulled([{ cardId: DEF, title: 'Card 500' }]);
+  assert.equal(report.status, 'done'); assert.equal(report.discarded, 1);
+  const reads = f.calls.filter(call => call.url.includes('/api/my-collection'));
+  assert.equal(reads.filter(call => !call.url.includes('q=')).length, 1);
+  assert.ok(reads.every(call => call.url.includes('q=') || call.url.includes('page=0')));
+  assert.equal(f.calls.some(call => call.url.includes('bulk-discard')), false);
+  assert.deepEqual(f.posts().map(call => call.url), [`/api/user-cards/${uuid(500)}/discard`]);
+});
+
+test('discardPulled does not depend on `total` in the filtered search and pages until a short page', async () => {
+  const f = fixture(0, { collection: ({ data }) => { const { total, ...rest } = data; return rest; } });
+  f.setRows(Array.from({ length: 60 }, (_, i) => entry(i + 1)));
+  const report = await f.service.discardPulled([{ cardId: DEF, title: 'Card' }]);
+  assert.equal(report.status, 'done'); assert.equal(report.discarded, 1);
+  assert.equal(f.calls.filter(call => call.url.includes('q=Card')).length, 2);
+});
+
+test('discardPulled removes the discarded copies from the saved collection cache', async () => {
+  const f = fixture(0);
+  seedCached(f, [1, 2, 3], { ownedCopies: [1, 2, 3].map(n => ({ id: uuid(n), starred: false, shiny: false })) });
+  f.setRows([entry(1), entry(2), entry(3)]);
+  await f.service.discardPulled([DEF, DEF].map(cardId => ({ cardId, title: 'Card' })));
+  const cached = f.store.get('wm_all_collection_v1').cards[0];
+  assert.equal(cached.count, 1); assert.deepEqual(Array.from(cached.ownedCardIds), [uuid(3)]);
+  await f.service.discardPulled([{ cardId: DEF, title: 'Card' }]);
+  assert.equal(f.store.get('wm_all_collection_v1').cards.length, 0);
+});
+
+test('discardPulled stops on a failed request, leaves it unconfirmed and forgets that card', async () => {
+  const f = fixture(0, { post: () => { throw Error('lost response'); } });
+  seedCached(f, [1, 2]); f.setRows([entry(1), entry(2)]);
+  const report = await f.service.discardPulled([DEF, DEF].map(cardId => ({ cardId, title: 'Card' })));
+  assert.equal(report.status, 'error'); assert.equal(report.discarded, 0); assert.equal(f.posts().length, 1);
+  assert.equal(report.batches[0].status, 'unconfirmed');
+  const cached = f.store.get('wm_all_collection_v1'); assert.equal(cached.cards.length, 0); assert.equal(cached.complete, false);
 });
 
 test('discardPulled refuses an empty or malformed selection before any request', async () => {
   const f = fixture(1);
   await assert.rejects(f.service.discardPulled([]));
-  await assert.rejects(f.service.discardPulled([{ cardId: 'nope' }]));
+  await assert.rejects(f.service.discardPulled([{ cardId: 'nope', title: 'Card' }]));
+  await assert.rejects(f.service.discardPulled([{ cardId: DEF }]));
   assert.equal(f.calls.length, 0);
 });

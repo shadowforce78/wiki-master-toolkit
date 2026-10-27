@@ -1085,7 +1085,9 @@
         if (!confirmed || !openAllSelected.size) return;
 
         setOpenAllActionBusy(true);
-        const requests = indexes.map((index) => ({ cardId: openAllSummaryCards[index]?.id })).filter((entry) => entry.cardId);
+        const requests = indexes
+          .map((index) => ({ cardId: openAllSummaryCards[index]?.id, title: openAllSummaryCards[index]?.title }))
+          .filter((entry) => entry.cardId);
         let report = null;
         let failure = null;
 

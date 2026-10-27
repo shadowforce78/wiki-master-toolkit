@@ -54,13 +54,13 @@
         const pause = core.readLocalValue('wm_atlas_price_pause_v1');
         if (pause?.until > Date.now()) throw Error(`Pause serveur en cours (${Math.ceil((pause.until - Date.now()) / 1000)} s). Réessaie ensuite.`);
       }
-      async function request(url, options = {}) {
+      async function request(url, options = {}, { optionalJson = false } = {}) {
         checkStop(); checkPause();
         const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000);
         try {
           const response = await fetcher(url, { credentials: 'include', cache: 'no-store', ...options, signal: controller.signal });
           let data;
-          try { data = await response.json(); } catch { throw Error('Réponse serveur illisible.'); }
+          try { data = await response.json(); } catch { if (!optionalJson) throw Error('Réponse serveur illisible.'); }
           if (!response.ok) {
             const retry = response.headers?.get('Retry-After');
             const delay = retry ? (/^\d+(?:\.\d+)?$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry) - Date.now()) : 0;
@@ -69,6 +69,7 @@
             }
             throw Error(`HTTP ${response.status}${typeof data?.error === 'string' ? ' : ' + data.error : ''}`);
           }
+          if (optionalJson) return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
           if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('Réponse serveur invalide.');
           return data;
         } finally { clearTimeout(timer); }
@@ -206,30 +207,79 @@
           return run();
         });
       }
+      // Finds the owned copies of one catalogue card with a title search instead of reading the
+      // whole collection (the same lookup the listing flow uses).
+      async function findCopies(cardId, title) {
+        // `total` is not reliable on a filtered search (the site only sends it with stats=1 and it
+        // may count the whole collection), so paging stops at the first short page instead.
+        const copies = new Map();
+        for (let page = 0; ; page++) {
+          if (page >= 100) throw Error(`Recherche trop large pour « ${title} ».`);
+          const data = await request(`/api/my-collection?sort=rarity&q=${encodeURIComponent(title)}&page=${page}&stats=0`);
+          if (!Array.isArray(data.collection)) throw Error(`Réponse de recherche invalide pour « ${title} ».`);
+          for (const raw of data.collection) if (raw?.card_id === cardId) copies.set(raw.id, model.entry(raw));
+          if (data.collection.length < PAGE_SIZE) return [...copies.values()];
+        }
+      }
+      // Drops discarded copies from the saved collection cache without rereading the collection.
+      // Cards whose result is uncertain are forgotten entirely and the cache is marked incomplete.
+      function forgetCopies(removed, uncertainCardIds = []) {
+        if (!removed.length && !uncertainCardIds.length) return;
+        const gone = new Set(removed.map(row => row.ownedId)), counts = new Map(), forgotten = new Set(uncertainCardIds);
+        for (const row of removed) counts.set(row.cardId, (counts.get(row.cardId) || 0) + 1);
+        const trim = meta => {
+          if (forgotten.has(meta.id)) return null;
+          const amount = counts.get(meta.id);
+          if (!amount) return meta;
+          const count = Math.max(0, (Number(meta.count) || 0) - amount);
+          if (!count) return null;
+          const ownedCardIds = (meta.ownedCardIds || []).filter(id => !gone.has(id));
+          return { ...meta, count, ownedCardIds, ownedCopies: (meta.ownedCopies || []).filter(copy => !gone.has(copy.id)),
+            ownedCardId: gone.has(meta.ownedCardId) ? ownedCardIds[0] || null : meta.ownedCardId };
+        };
+        const key = core.ALL_COLLECTION_KEY || 'wm_all_collection_v1', saved = core.readLocalValue(key);
+        if (Array.isArray(saved?.cards)) {
+          core.writeLocalValue(key, { ...saved, cards: saved.cards.map(trim).filter(Boolean),
+            total: Number.isSafeInteger(saved.total) ? Math.max(0, saved.total - removed.length) : saved.total,
+            complete: saved.complete === true && !forgotten.size });
+        }
+        for (const [id, meta] of [...(core.cardMetaById || [])]) {
+          if (!counts.has(id) && !forgotten.has(id)) continue;
+          const next = trim(meta);
+          if (next) { core.cardMetaById.set(id, next); continue; }
+          core.cardMetaById.delete(id);
+          const title = core.normalizeTitle?.(meta.title) || meta.title;
+          if (core.idByTitle?.get(title) === id) core.idByTitle.delete(title);
+        }
+      }
       // Discards pulled cards the user picked by hand (pack summary). Pack responses only know
-      // catalogue IDs, so copies are resolved here from a fresh full collection read. Favorites,
-      // shiny copies and anything in a pending trade or sale are never picked.
+      // catalogue IDs, so each card's copies are resolved with a title search (no full collection
+      // read) and discarded one by one through the per-copy endpoint. Favorites, shiny copies and
+      // anything in a pending trade or sale are never picked.
       async function discardPulled(requests, onProgress = () => {}) {
         if (active) throw Error('Une opération est déjà en cours.');
-        const wanted = new Map();
+        const wanted = new Map(), titles = new Map();
         for (const request of Array.isArray(requests) ? requests : []) {
-          if (!model.UUID.test(request?.cardId)) throw Error('Carte invalide.');
+          if (!model.UUID.test(request?.cardId) || typeof request.title !== 'string' || !request.title.trim()) throw Error('Carte invalide.');
           wanted.set(request.cardId, (wanted.get(request.cardId) || 0) + 1);
+          titles.set(request.cardId, request.title.trim());
         }
         if (!wanted.size) throw Error('Aucune carte sélectionnée.');
         active = true; cancelled = false;
         const report = { at: Date.now(), source: 'pack-summary', selected: 0, discarded: 0, skipped: 0, batches: [], status: 'verifying' };
-        const missing = {};
+        const missing = {}, removed = [];
         const run = async () => {
+          let uncertain = [];
           try {
-            onProgress({ text: 'Vérification de la collection…', report });
-            const fresh = await readCollection(text => onProgress({ text, report }));
-            snapshot = fresh;
-            updateOwnership([], true);
-            const { tradeIds, saleIds } = fresh.protections;
-            const chosen = [];
+            onProgress({ text: 'Vérification des échanges et enchères…', report });
+            const first = await request('/api/my-collection?sort=rarity&page=0&stats=1');
+            const mine = await request('/api/marketplace?page=1&limit=50&sort=recent&mine=1');
+            const { tradeIds, saleIds } = model.protection(first.pendingTradeCardIds, mine.selling);
+            const chosen = []; let looked = 0;
             for (const [cardId, count] of wanted) {
-              const copies = fresh.entries.filter(row => row.cardId === cardId && !row.starred && !row.shiny
+              checkStop();
+              onProgress({ text: `Recherche des exemplaires : ${++looked} / ${wanted.size}`, report });
+              const copies = (await findCopies(cardId, titles.get(cardId))).filter(row => !row.starred && !row.shiny
                 && !tradeIds.has(cardId) && !tradeIds.has(row.ownedId) && !saleIds.has(cardId));
               chosen.push(...copies.slice(0, count));
               const short = Math.max(0, count - copies.length);
@@ -237,36 +287,25 @@
               report.skipped += short;
             }
             report.selected = chosen.length;
-            for (let offset = 0; offset < chosen.length; offset += BATCH_SIZE) {
+            const attempt = { ids: chosen.map(row => row.ownedId), status: 'running', discarded: 0 };
+            report.batches.push(attempt); report.status = 'running'; saveReport(report);
+            for (const [position, row] of chosen.entries()) {
               checkStop(); checkPause();
-              const batch = chosen.slice(offset, offset + BATCH_SIZE);
-              const attempt = { ids: batch.map(row => row.ownedId), status: 'pending' };
-              report.batches.push(attempt); report.status = 'running'; saveReport(report);
               onProgress({ text: `Défausse : ${report.discarded} / ${chosen.length}`, report });
-              let data;
-              try {
-                data = await request('/api/user-cards/bulk-discard', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card_ids: attempt.ids }) });
-                if (!Number.isSafeInteger(data.discarded_count) || data.discarded_count < 0 || data.discarded_count > batch.length
-                  || (data.failed != null && !Array.isArray(data.failed))) throw Error('Résultat de défausse incomplet.');
-              } catch (error) {
-                attempt.status = 'unconfirmed';
-                updateOwnership(batch, false);
-                throw Error(`${error.message} Le résultat de ce lot est à vérifier sur le site ; aucun nouvel essai automatique.`);
+              try { await request(`/api/user-cards/${row.ownedId}/discard`, { method: 'POST' }, { optionalJson: true }); }
+              catch (error) {
+                attempt.status = 'unconfirmed'; attempt.unconfirmed = row.ownedId; uncertain = [row.cardId];
+                throw Error(`${error.message} Le résultat de cette carte est à vérifier sur le site ; aucun nouvel essai automatique.`);
               }
-              attempt.discarded = data.discarded_count;
-              attempt.failed = data.failed || [];
-              report.discarded += data.discarded_count;
-              attempt.status = data.discarded_count === batch.length && !attempt.failed.length ? 'done' : 'partial';
-              updateOwnership(batch, attempt.status === 'done');
-              saveReport(report);
-              if (attempt.status === 'partial') throw Error(`${data.discarded_count} / ${batch.length} exemplaires défaussés dans le dernier lot. Arrêt pour vérifier les refus du serveur.`);
-              if (offset + BATCH_SIZE < chosen.length) await wait(500);
+              attempt.discarded++; report.discarded++; removed.push(row);
+              if (position + 1 < chosen.length) await wait(150);
             }
-            report.status = 'done';
+            attempt.status = 'done'; report.status = 'done';
           } catch (error) {
             report.status = cancelled ? 'stopped' : 'error'; report.error = error.message;
+            for (const batch of report.batches) if (batch.status === 'running') batch.status = report.status;
           } finally {
-            snapshot = null; saveReport(report);
+            forgetCopies(removed, uncertain); saveReport(report);
           }
           return { ...report, missing };
         };
